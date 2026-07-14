@@ -43,6 +43,7 @@ import (
 	"github.com/grafana/pyroscope/v2/pkg/embedded/grafana"
 	"github.com/grafana/pyroscope/v2/pkg/featureflags"
 	"github.com/grafana/pyroscope/v2/pkg/ingester"
+	phlareobj "github.com/grafana/pyroscope/v2/pkg/objstore"
 	objstoreclient "github.com/grafana/pyroscope/v2/pkg/objstore/client"
 	"github.com/grafana/pyroscope/v2/pkg/objstore/providers/filesystem"
 	"github.com/grafana/pyroscope/v2/pkg/operations"
@@ -451,7 +452,17 @@ func (f *Pyroscope) initStoreGateway() (serv services.Service, err error) {
 		return nil, nil
 	}
 
-	svc, err := storegateway.NewStoreGateway(f.Cfg.StoreGateway, f.storageBucket, f.Overrides, f.logger, f.reg)
+	var indexBucket phlareobj.Bucket
+	if bcfg := f.Cfg.Storage.Bucket; bcfg.Backend == objstoreclient.Filesystem && bcfg.S3.BucketName != "" {
+		s3cfg := bcfg
+		s3cfg.Backend = objstoreclient.S3
+		if indexBucket, err = objstoreclient.NewBucket(f.context(), s3cfg, "bucket-index"); err != nil {
+			return nil, fmt.Errorf("init direct-S3 bucket-index client: %w", err)
+		}
+		level.Info(f.logger).Log("msg", "store-gateway reading bucket-index directly from S3 (bypassing filesystem/ndrive cache)")
+	}
+
+	svc, err := storegateway.NewStoreGateway(f.Cfg.StoreGateway, f.storageBucket, indexBucket, f.Overrides, f.logger, f.reg)
 	if err != nil {
 		return nil, err
 	}
