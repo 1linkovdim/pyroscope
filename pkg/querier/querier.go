@@ -56,6 +56,7 @@ func (cfg *Config) RegisterFlags(fs *flag.FlagSet) {
 
 type Limits interface {
 	QueryAnalysisSeriesEnabled(string) bool
+	DisableLabelSanitization(string) bool
 }
 
 type Querier struct {
@@ -274,6 +275,33 @@ func (q *Querier) LabelValues(ctx context.Context, req *connect.Request[typesv1.
 	}), nil
 }
 
+// keepUTF8LabelNames reports whether non-legacy (e.g. dotted) label names such
+// as "nf.app" should be preserved in label-listing responses rather than
+// filtered out by filterLabelNames.
+//
+// Upstream only preserves them when the request carries the per-request
+// allow-utf8-labelnames client capability. In the v1 read path that capability
+// never reaches the querier (it is parsed by the query-frontend HTTP middleware
+// but querier.NewGRPCHandler does not re-apply it, and it is not propagated over
+// the frontend->querier hop), so dotted label names are always filtered out of
+// typeahead/label listings even though they are stored and matchable.
+//
+// We additionally preserve them whenever label sanitization is disabled for the
+// tenant (validation.disable-label-sanitization). That is the same setting that
+// keeps dotted label names verbatim on the write path, so honoring it on read
+// makes read symmetric with write and works for every client (including the
+// Grafana datasource query editor and dashboard variables, which do not send
+// the capability).
+func (q *Querier) keepUTF8LabelNames(ctx context.Context) bool {
+	if capabilities, ok := featureflags.GetClientCapabilities(ctx); ok && capabilities.AllowUtf8LabelNames {
+		return true
+	}
+	if tenantID, err := tenant.TenantID(ctx); err == nil && q.limits.DisableLabelSanitization(tenantID) {
+		return true
+	}
+	return false
+}
+
 func filterLabelNames(labelNames []string) []string {
 	filtered := make([]string, 0, len(labelNames))
 	// Filter out label names not passing legacy validation if utf8 label names not enabled
@@ -303,7 +331,7 @@ func (q *Querier) LabelNames(ctx context.Context, req *connect.Request[typesv1.L
 		}
 
 		labelNames := uniqueSortedStrings(responses)
-		if capabilities, ok := featureflags.GetClientCapabilities(ctx); !ok || !capabilities.AllowUtf8LabelNames {
+		if !q.keepUTF8LabelNames(ctx) {
 			level.Debug(q.logger).Log("msg", "filtering out non-valid labels")
 			labelNames = filterLabelNames(labelNames)
 		}
@@ -357,7 +385,7 @@ func (q *Querier) LabelNames(ctx context.Context, req *connect.Request[typesv1.L
 	}
 
 	labelNames := uniqueSortedStrings(responses)
-	if capabilities, ok := featureflags.GetClientCapabilities(ctx); !ok || !capabilities.AllowUtf8LabelNames {
+	if !q.keepUTF8LabelNames(ctx) {
 		level.Debug(q.logger).Log("msg", "filtering out non-valid labels")
 		labelNames = filterLabelNames(labelNames)
 	}
@@ -410,7 +438,7 @@ func (q *Querier) filterLabelNames(
 	ctx context.Context,
 	req *connect.Request[querierv1.SeriesRequest],
 ) ([]string, error) {
-	if capabilities, ok := featureflags.GetClientCapabilities(ctx); ok && capabilities.AllowUtf8LabelNames {
+	if q.keepUTF8LabelNames(ctx) {
 		return req.Msg.LabelNames, nil
 	}
 
