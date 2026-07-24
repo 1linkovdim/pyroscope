@@ -104,6 +104,7 @@ func (cfg *BucketIndexConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix st
 
 type BucketStores struct {
 	storageBucket     phlareobj.Bucket
+	indexBucket       phlareobj.Bucket
 	cfg               BucketStoreConfig
 	logger            log.Logger
 	syncBackoffConfig backoff.Config
@@ -122,9 +123,10 @@ type BucketStores struct {
 	blocksLoaded      prometheus.GaugeFunc
 }
 
-func NewBucketStores(cfg BucketStoreConfig, shardingStrategy ShardingStrategy, storageBucket phlareobj.Bucket, limits Limits, logger log.Logger, reg prometheus.Registerer) (*BucketStores, error) {
+func NewBucketStores(cfg BucketStoreConfig, shardingStrategy ShardingStrategy, storageBucket phlareobj.Bucket, indexBucket phlareobj.Bucket, limits Limits, logger log.Logger, reg prometheus.Registerer) (*BucketStores, error) {
 	bs := &BucketStores{
 		storageBucket: storageBucket,
+		indexBucket:   indexBucket,
 		logger:        logger,
 		cfg:           cfg,
 		syncBackoffConfig: backoff.Config{
@@ -324,17 +326,22 @@ func (bs *BucketStores) getOrCreateStore(userID string) (*BucketStore, error) {
 
 	level.Info(userLogger).Log("msg", "creating user bucket store")
 
+	indexBucket := bs.storageBucket
+	if bs.indexBucket != nil {
+		indexBucket = bs.indexBucket
+	}
+
 	// The sharding strategy filter MUST be before the ones we create here (order matters).
 	filters := []block.MetadataFilter{
 		NewShardingMetadataFilterAdapter(userID, bs.shardingStrategy),
 		newMinTimeMetaFilter(bs.cfg.IgnoreBlocksWithin),
-		NewIgnoreDeletionMarkFilter(userLogger, bs.storageBucket, bs.cfg.IgnoreDeletionMarksDelay, bs.cfg.MetaSyncConcurrency),
+		NewIgnoreDeletionMarkFilter(userLogger, indexBucket, bs.cfg.IgnoreDeletionMarksDelay, bs.cfg.MetaSyncConcurrency),
 	}
 	fetcherReg := prometheus.NewRegistry()
 
 	fetcher := NewBucketIndexMetadataFetcher(
 		userID,
-		bs.storageBucket,
+		indexBucket,
 		bs.limits,
 		bs.logger,
 		fetcherReg,

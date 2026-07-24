@@ -84,7 +84,7 @@ func (c *Config) Validate(limits validation.Limits) error {
 	return nil
 }
 
-func NewStoreGateway(gatewayCfg Config, storageBucket phlareobj.Bucket, limits Limits, logger log.Logger, reg prometheus.Registerer) (*StoreGateway, error) {
+func NewStoreGateway(gatewayCfg Config, storageBucket phlareobj.Bucket, indexBucket phlareobj.Bucket, limits Limits, logger log.Logger, reg prometheus.Registerer) (*StoreGateway, error) {
 	ringStore, err := kv.NewClient(
 		gatewayCfg.ShardingRing.Ring.KVStore,
 		ring.GetCodec(),
@@ -95,10 +95,10 @@ func NewStoreGateway(gatewayCfg Config, storageBucket phlareobj.Bucket, limits L
 		return nil, fmt.Errorf("create KV store client: %w", err)
 	}
 
-	return newStoreGateway(gatewayCfg, storageBucket, ringStore, limits, logger, reg)
+	return newStoreGateway(gatewayCfg, storageBucket, indexBucket, ringStore, limits, logger, reg)
 }
 
-func newStoreGateway(gatewayCfg Config, storageBucket phlareobj.Bucket, ringStore kv.Client, limits Limits, logger log.Logger, reg prometheus.Registerer) (*StoreGateway, error) {
+func newStoreGateway(gatewayCfg Config, storageBucket phlareobj.Bucket, indexBucket phlareobj.Bucket, ringStore kv.Client, limits Limits, logger log.Logger, reg prometheus.Registerer) (*StoreGateway, error) {
 	var err error
 
 	g := &StoreGateway{
@@ -143,7 +143,7 @@ func newStoreGateway(gatewayCfg Config, storageBucket phlareobj.Bucket, ringStor
 
 	shardingStrategy = NewShuffleShardingStrategy(g.ring, lifecyclerCfg.ID, lifecyclerCfg.Addr, limits, logger)
 
-	g.stores, err = NewBucketStores(gatewayCfg.BucketStoreConfig, shardingStrategy, storageBucket, limits, logger, prometheus.WrapRegistererWith(prometheus.Labels{"component": "store-gateway"}, reg))
+	g.stores, err = NewBucketStores(gatewayCfg.BucketStoreConfig, shardingStrategy, storageBucket, indexBucket, limits, logger, prometheus.WrapRegistererWith(prometheus.Labels{"component": "store-gateway"}, reg))
 	if err != nil {
 		return nil, fmt.Errorf("create bucket stores: %w", err)
 	}

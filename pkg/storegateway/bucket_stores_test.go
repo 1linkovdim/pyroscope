@@ -49,7 +49,7 @@ func TestBucketStores_BlockMetricsRegistration(t *testing.T) {
 		MetaSyncConcurrency:   1,
 	}
 
-	stores, err := NewBucketStores(config, sharding, bucket, limits, logger, reg)
+	stores, err := NewBucketStores(config, sharding, bucket, nil, limits, logger, reg)
 	require.NoError(t, err)
 	require.NoError(t, stores.SyncBlocks(ctx))
 
