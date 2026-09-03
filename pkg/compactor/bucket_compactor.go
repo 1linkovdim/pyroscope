@@ -340,6 +340,18 @@ func newCompactorMetrics(r prometheus.Registerer) *CompactorMetrics {
 	return m
 }
 
+// isLoneIntermediateShardedBlock reports whether the compaction input is a
+// single sharded block that has not been merged past the deduplication level.
+// The split-and-merge grouper plans such a job on purpose, to promote a block
+// that has no sibling to merge with.
+func isLoneIntermediateShardedBlock(readers []phlaredb.BlockReader) bool {
+	if len(readers) != 1 {
+		return false
+	}
+	meta := readers[0].Meta()
+	return isIntermediateShardedBlock(&meta)
+}
+
 func (c *BlockCompactor) CompactWithSplitting(ctx context.Context, dest string, dirs []string, shardCount, stageSize uint64) ([]ulid.ULID, error) {
 	defer func() {
 		if err := recover(); err != nil {
@@ -410,11 +422,15 @@ func (c *BlockCompactor) CompactWithSplitting(ctx context.Context, dest string, 
 	c.metrics.Split.WithLabelValues(fmt.Sprintf("%d", currentLevel)).Observe(float64(shardCount))
 
 	metas, err := phlaredb.CompactWithSplitting(ctx, phlaredb.CompactWithSplittingOpts{
-		Src:                readers,
-		Dst:                dest,
-		SplitCount:         shardCount,
-		StageSize:          stageSize,
-		SplitBy:            c.splitBy,
+		Src:        readers,
+		Dst:        dest,
+		SplitCount: shardCount,
+		StageSize:  stageSize,
+		SplitBy:    c.splitBy,
+		// A merge job with a single input block is planned only to promote a
+		// sharded block that never got merged past the deduplication level, so
+		// the single-block compaction is deliberate here.
+		AllowSingleBlock:   isLoneIntermediateShardedBlock(readers),
 		DownsamplerEnabled: c.downsamplerEnabled,
 		Logger:             c.logger,
 	})

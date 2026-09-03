@@ -191,6 +191,57 @@ func TestCompactWithDownsampling(t *testing.T) {
 	assert.True(t, querier.metrics.profileTableAccess.DeleteLabelValues("profiles.parquet"))
 }
 
+// Compacting a single block on its own is normally a no-op, but the compactor
+// relies on it to promote a block that has no sibling to merge with to the next
+// compaction level.
+func TestCompactWithSplitting_SingleBlock(t *testing.T) {
+	ctx := context.Background()
+
+	b := newBlock(t, func() []*testhelper.ProfileBuilder {
+		return profileSeriesGenerator(t, time.Unix(1, 0), time.Unix(10, 0), time.Second, "job", "a")
+	})
+
+	t.Run("rejected by default", func(t *testing.T) {
+		_, err := CompactWithSplitting(ctx, CompactWithSplittingOpts{
+			Src:        []BlockReader{b},
+			Dst:        t.TempDir(),
+			SplitCount: 1,
+			SplitBy:    SplitByFingerprint,
+			Logger:     log.NewNopLogger(),
+		})
+		require.ErrorContains(t, err, "not enough blocks to compact")
+	})
+
+	t.Run("allowed explicitly", func(t *testing.T) {
+		compacted, err := CompactWithSplitting(ctx, CompactWithSplittingOpts{
+			Src:              []BlockReader{b},
+			Dst:              t.TempDir(),
+			SplitCount:       1,
+			SplitBy:          SplitByFingerprint,
+			AllowSingleBlock: true,
+			Logger:           log.NewNopLogger(),
+		})
+		require.NoError(t, err)
+		require.Len(t, compacted, 1)
+		require.Equal(t, b.Meta().MinTime, compacted[0].MinTime)
+		require.Equal(t, b.Meta().MaxTime, compacted[0].MaxTime)
+		// The point of the promotion: the output sits one level higher.
+		require.Equal(t, b.Meta().Compaction.Level+1, compacted[0].Compaction.Level)
+	})
+
+	t.Run("no source blocks is always rejected", func(t *testing.T) {
+		_, err := CompactWithSplitting(ctx, CompactWithSplittingOpts{
+			Src:              nil,
+			Dst:              t.TempDir(),
+			SplitCount:       1,
+			SplitBy:          SplitByFingerprint,
+			AllowSingleBlock: true,
+			Logger:           log.NewNopLogger(),
+		})
+		require.ErrorContains(t, err, "not enough blocks to compact")
+	})
+}
+
 func TestCompactWithSplitting(t *testing.T) {
 	ctx := context.Background()
 

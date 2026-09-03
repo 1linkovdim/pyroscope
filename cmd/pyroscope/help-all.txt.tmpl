@@ -51,6 +51,8 @@ Usage of ./pyroscope:
     	Duration after which the blocks marked for deletion will be filtered out while fetching blocks. The idea of ignore-deletion-marks-delay is to ignore blocks that are marked for deletion with some delay. This ensures store can still serve blocks that are meant to be deleted but do not have a replacement yet. (default 30m0s)
   -blocks-storage.bucket-store.meta-sync-concurrency int
     	Number of Go routines to use when syncing block meta files from object storage per tenant. (default 20)
+  -blocks-storage.bucket-store.symbol-cache-max-bytes int
+    	[experimental] Max size - in bytes - of the in-process cache of decoded symbol tables, shared across all blocks and tenants. Avoids re-decoding a block's symbols on every query. 0 disables the cache.
   -blocks-storage.bucket-store.sync-dir string
     	Directory to store synchronized pyroscope block headers. This directory is not required to be persisted between restarts, but it's highly recommended in order to improve the store-gateway startup time. (default "./data/pyroscope-sync/")
   -blocks-storage.bucket-store.sync-interval duration
