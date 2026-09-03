@@ -2056,6 +2056,12 @@ bucket_store:
   # have a replacement yet.
   # CLI flag: -blocks-storage.bucket-store.ignore-deletion-marks-delay
   [ignore_deletion_mark_delay: <duration> | default = 30m]
+
+  # (experimental) Max size - in bytes - of the in-process cache of decoded
+  # symbol tables, shared across all blocks and tenants. Avoids re-decoding a
+  # block's symbols on every query. 0 disables the cache.
+  # CLI flag: -blocks-storage.bucket-store.symbol-cache-max-bytes
+  [symbol_cache_max_bytes: <int> | default = 0]
 ```
 
 ### compactor
