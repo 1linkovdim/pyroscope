@@ -59,6 +59,12 @@ type CompactWithSplittingOpts struct {
 	SplitBy            SplitByFunc
 	DownsamplerEnabled bool
 	Logger             log.Logger
+
+	// AllowSingleBlock permits compacting a single source block without
+	// splitting it. That is normally a no-op and therefore rejected, but the
+	// compactor uses it to promote a block to the next compaction level when it
+	// has no sibling to merge with.
+	AllowSingleBlock bool
 }
 
 func Compact(ctx context.Context, src []BlockReader, dst string) (meta block.Meta, err error) {
@@ -80,7 +86,7 @@ func Compact(ctx context.Context, src []BlockReader, dst string) (meta block.Met
 func CompactWithSplitting(ctx context.Context, opts CompactWithSplittingOpts) (
 	[]block.Meta, error,
 ) {
-	if len(opts.Src) <= 1 && opts.SplitCount == 1 {
+	if len(opts.Src) == 0 || (len(opts.Src) == 1 && opts.SplitCount == 1 && !opts.AllowSingleBlock) {
 		return nil, errors.New("not enough blocks to compact")
 	}
 	if opts.SplitCount == 0 {

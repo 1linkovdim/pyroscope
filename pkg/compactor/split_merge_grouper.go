@@ -124,6 +124,10 @@ func planCompaction(userID string, blocks []*block.Meta, ranges []int64, shardCo
 		// Sort blocks by min time.
 		sortMetasByMinTime(mainBlocks)
 
+		// Remember where this group's jobs start, so the premature-compaction
+		// filter below can be applied to them alone.
+		groupStart := len(jobs)
+
 		for _, tr := range ranges {
 		nextJob:
 			for _, job := range planCompactionByRange(userID, mainBlocks, tr, tr == ranges[0], shardCount, splitGroups) {
@@ -140,31 +144,36 @@ func planCompaction(userID string, blocks []*block.Meta, ranges []int64, shardCo
 				jobs = append(jobs, job)
 			}
 		}
-	}
 
-	// Ensure we don't compact the most recent blocks prematurely when another one of
-	// the same size still fits in the range. To do it, we consider a job valid only
-	// if its range is before the most recent block or if it fully covers the range.
-	highestMaxTime := getMaxTime(blocks)
+		// Ensure we don't compact the most recent blocks prematurely when another one of
+		// the same size still fits in the range. To do it, we consider a job valid only
+		// if its range is before the most recent block or if it fully covers the range.
+		//
+		// The reference point is the most recent block *of this group*: groups are
+		// independent streams of data, often written by unrelated services on
+		// unrelated schedules, so taking the maximum across all of them lets the
+		// group with the freshest data gate compaction for every other group.
+		highestMaxTime := getMaxTime(mainBlocks)
 
-	for idx := 0; idx < len(jobs); {
-		job := jobs[idx]
+		for idx := groupStart; idx < len(jobs); {
+			job := jobs[idx]
 
-		// If the job covers a range before the most recent block, it's fine.
-		if job.rangeEnd <= highestMaxTime {
-			idx++
-			continue
+			// If the job covers a range before the most recent block, it's fine.
+			if job.rangeEnd <= highestMaxTime {
+				idx++
+				continue
+			}
+
+			// If the job covers the full range, it's fine.
+			if job.maxTime()-job.minTime() == job.rangeLength() {
+				idx++
+				continue
+			}
+
+			// We have found a job which would compact recent blocks prematurely,
+			// so we need to filter it out.
+			jobs = append(jobs[:idx], jobs[idx+1:]...)
 		}
-
-		// If the job covers the full range, it's fine.
-		if job.maxTime()-job.minTime() == job.rangeLength() {
-			idx++
-			continue
-		}
-
-		// We have found a job which would compact recent blocks prematurely,
-		// so we need to filter it out.
-		jobs = append(jobs[:idx], jobs[idx+1:]...)
 	}
 
 	// Jobs will be sorted later using configured job sorting algorithm.
@@ -200,8 +209,17 @@ func planCompactionByRange(userID string, blocks []*block.Meta, tr int64, isSmal
 		// (or we're not processing the smallest time range, or splitting is disabled).
 		// Then, we can check if there's any group of blocks to be merged together for each shard.
 		for shardID, shardBlocks := range groupBlocksByShardID(group.blocks) {
-			// No merging to do if there are less than 2 blocks.
-			if len(shardBlocks) < 2 {
+			// Normally there is no merging to do if there are less than 2 blocks:
+			// a block that has no sibling in its shard is already as compacted as
+			// it can get, and re-compacting it on its own would never terminate.
+			//
+			// The exception is a lone block that is still an intermediate
+			// compaction artefact, i.e. below the level at which data is
+			// deduplicated. Such a block is not directly queryable (the querier
+			// prefers its ancestors, which may already have been deleted), so it
+			// must be merged on its own to be promoted past the deduplication
+			// level. This terminates because the merge output is one level higher.
+			if len(shardBlocks) < 2 && !isOrphanedIntermediateBlock(shardCount, shardID, shardBlocks) {
 				continue
 			}
 
@@ -219,6 +237,32 @@ func planCompactionByRange(userID string, blocks []*block.Meta, tr int64, isSmal
 	}
 
 	return jobs
+}
+
+// isOrphanedIntermediateBlock reports whether the given single-block shard group
+// holds a sharded block that is stuck below the deduplication level, and so has
+// to be merged on its own to become queryable.
+func isOrphanedIntermediateBlock(shardCount uint32, shardID string, shardBlocks []*block.Meta) bool {
+	if shardCount == 0 || shardID == "" || len(shardBlocks) != 1 {
+		return false
+	}
+	return isIntermediateShardedBlock(shardBlocks[0])
+}
+
+// isIntermediateShardedBlock reports whether the block is the sharded output of
+// the split stage that has not been merged past the deduplication level yet.
+//
+// Such a block is only queryable at the cost of deduplicating it against its
+// siblings, and only for as long as its ancestors have not been deleted, so the
+// compactor has to promote it even though it has no sibling to merge with.
+func isIntermediateShardedBlock(meta *block.Meta) bool {
+	if meta == nil || meta.Labels[sharding.CompactorShardIDLabel] == "" {
+		return false
+	}
+	// A sharded block is always the output of at least the split stage, so a zero
+	// level means the metadata is missing rather than that the block is new.
+	compactionLevel := int32(meta.Compaction.Level)
+	return compactionLevel > 0 && block.IsIntermediate(compactionLevel, true)
 }
 
 // planSplitting returns a job to split the blocks in the input group or nil if there's nothing to do because

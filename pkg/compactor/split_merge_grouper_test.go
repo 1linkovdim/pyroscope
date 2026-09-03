@@ -509,6 +509,67 @@ func TestPlanCompaction(t *testing.T) {
 				}},
 			},
 		},
+		"should merge a lone sharded block still below the deduplication level, so that it can be promoted": {
+			ranges:     []int64{20, 40},
+			shardCount: 2,
+			blocks: []*block.Meta{
+				{ULID: block1, MinTime: 0, MaxTime: 20, Labels: map[string]string{sharding.CompactorShardIDLabel: "1_of_2"}, Compaction: block.BlockMetaCompaction{Level: 2}},
+			},
+			expected: []*job{
+				{userID: userID, stage: stageMerge, shardID: "1_of_2", blocksGroup: blocksGroup{
+					rangeStart: 0,
+					rangeEnd:   20,
+					blocks: []*block.Meta{
+						{ULID: block1, MinTime: 0, MaxTime: 20, Labels: map[string]string{sharding.CompactorShardIDLabel: "1_of_2"}, Compaction: block.BlockMetaCompaction{Level: 2}},
+					},
+				}},
+			},
+		},
+		"should not merge a lone sharded block that already reached the deduplication level": {
+			ranges:     []int64{20, 40},
+			shardCount: 2,
+			blocks: []*block.Meta{
+				{ULID: block1, MinTime: 0, MaxTime: 20, Labels: map[string]string{sharding.CompactorShardIDLabel: "1_of_2"}, Compaction: block.BlockMetaCompaction{Level: 3}},
+			},
+			expected: nil,
+		},
+		"should not merge a lone sharded block with no compaction metadata": {
+			ranges:     []int64{20, 40},
+			shardCount: 2,
+			blocks: []*block.Meta{
+				{ULID: block1, MinTime: 0, MaxTime: 20, Labels: map[string]string{sharding.CompactorShardIDLabel: "1_of_2"}},
+			},
+			expected: nil,
+		},
+		"should not compact a group's most recent blocks prematurely just because another group has fresher blocks": {
+			ranges: []int64{10, 20},
+			blocks: []*block.Meta{
+				// Group "a" has not reached the end of the [20, 30) range yet.
+				{ULID: block1, MinTime: 20, MaxTime: 25, Labels: map[string]string{"group": "a"}},
+				{ULID: block2, MinTime: 25, MaxTime: 28, Labels: map[string]string{"group": "a"}},
+				// Group "b" is further ahead in time, but that says nothing about group "a".
+				{ULID: block3, MinTime: 40, MaxTime: 50, Labels: map[string]string{"group": "b"}},
+			},
+			expected: nil,
+		},
+		"should compact a group whose range is closed, regardless of other groups": {
+			ranges: []int64{10, 20},
+			blocks: []*block.Meta{
+				{ULID: block1, MinTime: 20, MaxTime: 25, Labels: map[string]string{"group": "a"}},
+				{ULID: block2, MinTime: 25, MaxTime: 30, Labels: map[string]string{"group": "a"}},
+				{ULID: block3, MinTime: 40, MaxTime: 50, Labels: map[string]string{"group": "b"}},
+			},
+			expected: []*job{
+				{userID: userID, stage: stageMerge, blocksGroup: blocksGroup{
+					rangeStart: 20,
+					rangeEnd:   30,
+					blocks: []*block.Meta{
+						{ULID: block1, MinTime: 20, MaxTime: 25, Labels: map[string]string{"group": "a"}},
+						{ULID: block2, MinTime: 25, MaxTime: 30, Labels: map[string]string{"group": "a"}},
+					},
+				}},
+			},
+		},
 	}
 
 	for testName, testData := range tests {

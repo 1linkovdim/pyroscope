@@ -17,6 +17,7 @@ import (
 
 	ingestv1 "github.com/grafana/pyroscope/api/gen/proto/go/ingester/v1"
 	typesv1 "github.com/grafana/pyroscope/api/gen/proto/go/types/v1"
+	"github.com/grafana/pyroscope/v2/pkg/phlaredb/block"
 	"github.com/grafana/pyroscope/v2/pkg/phlaredb/sharding"
 	"github.com/grafana/pyroscope/v2/pkg/util"
 	"github.com/grafana/pyroscope/v2/pkg/util/spanlogger"
@@ -216,10 +217,16 @@ func (r *replicasPerBlockID) hasShardedBlocks() bool {
 }
 
 // pruneIncompleteShardedBlocks drops sharded blocks for any window instant that
-// is missing a shard. It must run before pruneSupersededBlocks, so an incomplete
-// set's lower-level ancestors survive as a fallback. deduplicationLevel is the
-// level at/above which blocks are deduplicated (3 when sharded).
-func (r *replicasPerBlockID) pruneIncompleteShardedBlocks(deduplicationLevel int32) error {
+// is missing a shard. Only blocks at or above minLevel are counted towards
+// completeness.
+//
+// It runs twice. First with minLevel = deduplicationLevel, before
+// pruneSupersededBlocks, so that an incomplete set of deduplicated blocks is
+// pruned while its lower-level ancestors are still around to serve as a
+// fallback. Then again with minLevel = 0, after pruneSupersededBlocks, to check
+// that whatever survived the collapse - which may include intermediate blocks
+// kept as a last resort - still covers every shard.
+func (r *replicasPerBlockID) pruneIncompleteShardedBlocks(minLevel int32) error {
 	// Completeness is checked per sharding (shard count) and per time instant, not
 	// by compaction level: a window's shards can legitimately sit at different
 	// levels (a partial late re-merge advances only some), so keying on level would
@@ -230,9 +237,11 @@ func (r *replicasPerBlockID) pruneIncompleteShardedBlocks(deduplicationLevel int
 	// covering that instant. Coverage (minTime <= t < maxTime), rather than an exact
 	// minTime match, keeps a wider block (a shard merged to a longer span) counted
 	// for the later windows it overlaps, so sibling shards' blocks there are not
-	// orphaned and silently pruned. Only blocks >= deduplicationLevel count;
-	// intermediate lower blocks are never served (pruneSupersededBlocks drops them)
-	// so must not satisfy a shard.
+	// orphaned and silently pruned. Only blocks >= minLevel count:
+	// intermediate lower blocks are preferentially dropped by
+	// pruneSupersededBlocks, so they must not satisfy a shard here. They are also
+	// never pruned here, which is what lets pruneSupersededBlocks keep them as a
+	// last resort when their ancestors are gone.
 	type shardedBlock struct {
 		id      string
 		shard   uint64
@@ -249,7 +258,7 @@ func (r *replicasPerBlockID) pruneIncompleteShardedBlocks(deduplicationLevel int
 		if !ok {
 			continue
 		}
-		if meta.Compaction == nil || meta.Compaction.Level < deduplicationLevel {
+		if meta.Compaction == nil || meta.Compaction.Level < minLevel {
 			continue
 		}
 		byShardCount[shardCount] = append(byShardCount[shardCount],
@@ -320,37 +329,83 @@ func (r *replicasPerBlockID) pruneIncompleteShardedBlocks(deduplicationLevel int
 	return nil
 }
 
-// prunes blocks that are contained by a higher compaction level block
-func (r *replicasPerBlockID) pruneSupersededBlocks(sharded bool) error {
+// pruneSupersededBlocks removes blocks whose data is fully contained in a block
+// at or above the deduplication level, and collapses intermediate compaction
+// artefacts when a complete lower-level fallback is still available.
+//
+// deduplicationLevel is the level at/above which a block is authoritative for
+// its range (see block.DeduplicationLevel).
+func (r *replicasPerBlockID) pruneSupersededBlocks(deduplicationLevel int32) error {
+	// First pass: authoritative blocks supersede every ancestor they were built
+	// from, including any intermediate blocks recorded as parents.
 	for blockID := range r.m {
 		meta, ok := r.meta[blockID]
 		if !ok {
 			return fmt.Errorf("meta missing for block id %s", blockID)
 		}
-		if meta.Compaction == nil {
+		if meta.Compaction == nil || meta.Compaction.Level < deduplicationLevel {
 			continue
 		}
-		if meta.Compaction.Level < 2 {
-			continue
+		for _, ancestor := range meta.Compaction.Parents {
+			r.removeBlock(ancestor)
 		}
-		// At split phase of compaction, L2 is an intermediate step where we
-		// split each group into split_shards parts, thus there will be up to
-		// groups_num * split_shards blocks, which is typically _significantly_
-		// greater that the number of source blocks. Moreover, these blocks are
-		// not yet deduplicated, therefore we should prefer L1 blocks over them.
-		// As an optimisation, we drop all L2 blocks.
-		if sharded && meta.Compaction.Level == 2 {
-			r.removeBlock(blockID)
-			continue
-		}
-		for _, blockID := range meta.Compaction.Parents {
-			r.removeBlock(blockID)
-		}
-		for _, blockID := range meta.Compaction.Sources {
-			r.removeBlock(blockID)
+		for _, ancestor := range meta.Compaction.Sources {
+			r.removeBlock(ancestor)
 		}
 	}
+
+	// Second pass: intermediate blocks (compacted at least once, but still below
+	// the deduplication level – the split stage of split-and-merge compaction).
+	// Reading them is more expensive than reading their ancestors: the split
+	// stage fans a group out into shard_count blocks, which is typically
+	// _significantly_ more blocks than it consumed, and they are not yet
+	// deduplicated either way. So we prefer the ancestors – but only if they are
+	// all still there. If any of them is gone, the intermediate block is the only
+	// remaining copy of that data and dropping it loses the range entirely; keep
+	// it instead and let the query deduplicate.
+	for blockID := range r.m {
+		meta, ok := r.meta[blockID]
+		if !ok {
+			return fmt.Errorf("meta missing for block id %s", blockID)
+		}
+		// Level < 2 means the block has not been compacted yet: it has no
+		// ancestors to fall back to and is served as-is.
+		if meta.Compaction == nil || meta.Compaction.Level < 2 || meta.Compaction.Level >= deduplicationLevel {
+			continue
+		}
+		if r.ancestorsLive(meta) {
+			r.removeBlock(blockID)
+			continue
+		}
+		level.Warn(r.logger).Log(
+			"msg", "querying intermediate compaction level block: its ancestors are no longer available",
+			"block", blockID,
+			"compaction_level", meta.Compaction.Level,
+			"deduplication_level", deduplicationLevel,
+		)
+	}
+
 	return nil
+}
+
+// ancestorsLive reports whether the block's ancestors are all still present and
+// can therefore serve its range in its place. A block with no recorded
+// ancestors has no known fallback.
+func (r *replicasPerBlockID) ancestorsLive(meta *typesv1.BlockInfo) bool {
+	if len(meta.Compaction.Sources) == 0 && len(meta.Compaction.Parents) == 0 {
+		return false
+	}
+	for _, ancestor := range meta.Compaction.Sources {
+		if _, ok := r.m[ancestor]; !ok {
+			return false
+		}
+	}
+	for _, ancestor := range meta.Compaction.Parents {
+		if _, ok := r.m[ancestor]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 type blockPlanEntry struct {
@@ -391,12 +446,9 @@ func (r *replicasPerBlockID) blockPlan(ctx context.Context) map[string]*blockPla
 	sharded := r.hasShardedBlocks()
 
 	// Depending on whether split sharding is used, the compaction level at
-	// which the data gets deduplicated differs: if split sharding is enabled,
-	// we deduplicate at level 3, and at level 2 otherwise.
-	var deduplicationLevel int32 = 2
-	if sharded {
-		deduplicationLevel = 3
-	}
+	// which the data gets deduplicated differs. The compactor uses the same
+	// threshold, so the two stay in agreement.
+	deduplicationLevel := block.DeduplicationLevel(sharded)
 
 	// Prune incomplete sharded sets first, so that any lower-level ancestors
 	// survive as a fallback, then collapse the surviving blocks per shard.
@@ -405,8 +457,16 @@ func (r *replicasPerBlockID) blockPlan(ctx context.Context) map[string]*blockPla
 		return nil
 	}
 
-	if err := r.pruneSupersededBlocks(sharded); err != nil {
+	if err := r.pruneSupersededBlocks(deduplicationLevel); err != nil {
 		level.Warn(r.logger).Log("msg", "block planning failed to prune superseded blocks", "err", err)
+		return nil
+	}
+
+	// Re-check completeness over what survived: pruneSupersededBlocks may have
+	// kept intermediate blocks that the first check did not count, and it may
+	// have removed ancestors that were covering a shard.
+	if err := r.pruneIncompleteShardedBlocks(0); err != nil {
+		level.Warn(r.logger).Log("msg", "block planning failed to prune incomplete sharded blocks", "err", err)
 		return nil
 	}
 

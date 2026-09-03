@@ -476,10 +476,11 @@ func Test_replicasPerBlockID_blockPlan(t *testing.T) {
 		},
 		{
 			// Mid-merge: shard 0 at L3, shard 1 only in an intermediate L2 block, no
-			// L1. The L2 block gets dropped by superseding, so it must not count shard
-			// 1 as present - otherwise we'd serve shard 0 alone (half the data). The
-			// set is incomplete -> everything pruned (transient empty, not undercount).
-			name: "do not let an intermediate L2 block satisfy shard completeness",
+			// L1. The L2 block must not count shard 1 as present at the deduplicated
+			// level - otherwise we'd serve shard 0 alone (half the data). The L3 block
+			// is therefore pruned, and the intermediate L2 blocks left behind do cover
+			// both shards, so they are served with deduplication.
+			name: "an intermediate L2 block does not satisfy shard completeness at the deduplicated level",
 			inputs: func(r *replicasPerBlockID) {
 				t1, _ := time.Parse(time.RFC3339, "2021-01-01T00:00:00Z")
 				r.add([]ResponseFromReplica[[]*typesv1.BlockInfo]{
@@ -494,6 +495,37 @@ func Test_replicasPerBlockID_blockPlan(t *testing.T) {
 								info(),
 							newBlockInfo("s0-l2").
 								withCompactionLevel(2).
+								withCompactorShard(0, 2).
+								withMinTime(t1, time.Hour).
+								info(),
+							// shard 1 only exists as an intermediate L2 block.
+							newBlockInfo("s1-l2").
+								withCompactionLevel(2).
+								withCompactorShard(1, 2).
+								withMinTime(t1, time.Hour).
+								info(),
+						},
+					},
+				}, storeGatewayInstance)
+			},
+			validators: []validatorFunc{
+				validatePlanBlockIDs("s0-l2", "s1-l2"),
+				validatePlanDeduplication(true),
+			},
+		},
+		{
+			// Same shape, but shard 0 has no intermediate block left behind: pruning
+			// the incomplete L3 set leaves shard 1 alone, which would be half the
+			// data, so everything is pruned (transient empty, not undercount).
+			name: "prune a surviving intermediate block that does not cover every shard",
+			inputs: func(r *replicasPerBlockID) {
+				t1, _ := time.Parse(time.RFC3339, "2021-01-01T00:00:00Z")
+				r.add([]ResponseFromReplica[[]*typesv1.BlockInfo]{
+					{
+						addr: "store-gateway-0",
+						response: []*typesv1.BlockInfo{
+							newBlockInfo("s0-l3").
+								withCompactionLevel(3).
 								withCompactorShard(0, 2).
 								withMinTime(t1, time.Hour).
 								info(),
@@ -560,6 +592,121 @@ func Test_replicasPerBlockID_blockPlan(t *testing.T) {
 				validatePlanBlocksOnReplica("ingester-0", "b"),
 			},
 		},
+		{
+			// The split stage of compaction produces intermediate blocks that are
+			// preferentially dropped in favour of their ancestors. If the ancestors
+			// are gone, dropping them loses the range entirely, so they must be
+			// served (with deduplication) instead.
+			name: "keep intermediate sharded blocks whose ancestors are gone",
+			inputs: func(r *replicasPerBlockID) {
+				t1, _ := time.Parse(time.RFC3339, "2021-01-01T00:00:00Z")
+				r.add([]ResponseFromReplica[[]*typesv1.BlockInfo]{
+					{
+						addr: "store-gateway-0",
+						response: []*typesv1.BlockInfo{
+							newBlockInfo("s0").
+								withMinTime(t1, time.Hour).
+								withCompactionLevel(2).
+								withCompactionSources("a", "b").
+								withCompactorShard(0, 2).
+								info(),
+
+							newBlockInfo("s1").
+								withMinTime(t1, time.Hour).
+								withCompactionLevel(2).
+								withCompactionSources("a", "b").
+								withCompactorShard(1, 2).
+								info(),
+						},
+					},
+				}, storeGatewayInstance)
+			},
+			validators: []validatorFunc{
+				validatePlanBlockIDs("s0", "s1"),
+				validatePlanDeduplication(true),
+			},
+		},
+		{
+			name: "drop intermediate sharded blocks whose ancestors are all still available",
+			inputs: func(r *replicasPerBlockID) {
+				t1, _ := time.Parse(time.RFC3339, "2021-01-01T00:00:00Z")
+				r.add([]ResponseFromReplica[[]*typesv1.BlockInfo]{
+					{
+						addr: "store-gateway-0",
+						response: []*typesv1.BlockInfo{
+							newBlockInfo("a").withMinTime(t1, 30*time.Minute).info(),
+							newBlockInfo("b").withMinTime(t1, time.Hour).info(),
+
+							newBlockInfo("s0").
+								withMinTime(t1, time.Hour).
+								withCompactionLevel(2).
+								withCompactionSources("a", "b").
+								withCompactorShard(0, 2).
+								info(),
+
+							newBlockInfo("s1").
+								withMinTime(t1, time.Hour).
+								withCompactionLevel(2).
+								withCompactionSources("a", "b").
+								withCompactorShard(1, 2).
+								info(),
+						},
+					},
+				}, storeGatewayInstance)
+			},
+			validators: []validatorFunc{
+				validatePlanBlockIDs("a", "b"),
+				validatePlanDeduplication(true),
+			},
+		},
+		{
+			// A block at or above the deduplication level supersedes everything it
+			// was built from, including the intermediate blocks recorded as parents.
+			name: "drop intermediate sharded blocks superseded by a deduplicated block",
+			inputs: func(r *replicasPerBlockID) {
+				t1, _ := time.Parse(time.RFC3339, "2021-01-01T00:00:00Z")
+				r.add([]ResponseFromReplica[[]*typesv1.BlockInfo]{
+					{
+						addr: "store-gateway-0",
+						response: []*typesv1.BlockInfo{
+							newBlockInfo("s0").
+								withMinTime(t1, time.Hour).
+								withCompactionLevel(2).
+								withCompactionSources("a", "b").
+								withCompactorShard(0, 2).
+								info(),
+
+							newBlockInfo("s1").
+								withMinTime(t1, time.Hour).
+								withCompactionLevel(2).
+								withCompactionSources("a", "b").
+								withCompactorShard(1, 2).
+								info(),
+
+							newBlockInfo("m0").
+								withMinTime(t1, time.Hour).
+								withCompactionLevel(3).
+								withCompactionSources("a", "b").
+								withCompactionParents("s0").
+								withCompactorShard(0, 2).
+								info(),
+
+							newBlockInfo("m1").
+								withMinTime(t1, time.Hour).
+								withCompactionLevel(3).
+								withCompactionSources("a", "b").
+								withCompactionParents("s1").
+								withCompactorShard(1, 2).
+								info(),
+						},
+					},
+				}, storeGatewayInstance)
+			},
+			validators: []validatorFunc{
+				validatePlanBlockIDs("m0", "m1"),
+				validatePlanDeduplication(false),
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newReplicasPerBlockID(log.NewNopLogger())
@@ -615,5 +762,55 @@ func Test_pruneIncompleteShardedBlocks_logging(t *testing.T) {
 		plan := r.blockPlan(context.TODO())
 		require.NotEmpty(t, plan)
 		require.NotContains(t, buf.String(), warnMsg, "must not warn for a complete window")
+	})
+}
+
+// Serving an intermediate compaction level block is a last resort: it means the
+// compactor left the data in a state it never promoted out of, so it must be
+// visible in the logs.
+func Test_pruneSupersededBlocks_logging(t *testing.T) {
+	t1, _ := time.Parse(time.RFC3339, "2021-01-01T00:00:00Z")
+
+	const warnMsg = "its ancestors are no longer available"
+
+	t.Run("warns when an intermediate block has to be served", func(t *testing.T) {
+		var buf bytes.Buffer
+		r := newReplicasPerBlockID(log.NewLogfmtLogger(&buf))
+		r.add([]ResponseFromReplica[[]*typesv1.BlockInfo]{
+			{
+				addr: "store-gateway-0",
+				response: []*typesv1.BlockInfo{
+					newBlockInfo("s0").withMinTime(t1, time.Hour).withCompactionLevel(2).
+						withCompactionSources("a").withCompactorShard(0, 2).info(),
+					newBlockInfo("s1").withMinTime(t1, time.Hour).withCompactionLevel(2).
+						withCompactionSources("a").withCompactorShard(1, 2).info(),
+				},
+			},
+		}, storeGatewayInstance)
+
+		plan := r.blockPlan(context.TODO())
+		require.NotEmpty(t, plan)
+		require.Contains(t, buf.String(), warnMsg)
+	})
+
+	t.Run("does not warn when the ancestors are still available", func(t *testing.T) {
+		var buf bytes.Buffer
+		r := newReplicasPerBlockID(log.NewLogfmtLogger(&buf))
+		r.add([]ResponseFromReplica[[]*typesv1.BlockInfo]{
+			{
+				addr: "store-gateway-0",
+				response: []*typesv1.BlockInfo{
+					newBlockInfo("a").withMinTime(t1, time.Hour).info(),
+					newBlockInfo("s0").withMinTime(t1, time.Hour).withCompactionLevel(2).
+						withCompactionSources("a").withCompactorShard(0, 2).info(),
+					newBlockInfo("s1").withMinTime(t1, time.Hour).withCompactionLevel(2).
+						withCompactionSources("a").withCompactorShard(1, 2).info(),
+				},
+			},
+		}, storeGatewayInstance)
+
+		plan := r.blockPlan(context.TODO())
+		require.NotEmpty(t, plan)
+		require.NotContains(t, buf.String(), warnMsg)
 	})
 }
