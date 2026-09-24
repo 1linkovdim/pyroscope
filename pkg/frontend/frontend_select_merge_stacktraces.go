@@ -29,40 +29,47 @@ func (f *Frontend) SelectMergeStacktraces(
 	if len(c.Msg.TraceIdSelector) > 0 {
 		return nil, connect.NewError(connect.CodeUnimplemented, errors.New("trace_id_selector is only supported with the v2 query backend"))
 	}
-	t, err := f.selectMergeStacktracesTree(ctx, c)
+	t, maxNodes, err := f.selectMergeStacktracesTree(ctx, c)
 	if err != nil {
 		return nil, err
 	}
 	var resp querierv1.SelectMergeStacktracesResponse
 	switch c.Msg.Format {
 	default:
-		resp.Flamegraph = phlaremodel.NewFlameGraph(t, c.Msg.GetMaxNodes())
+		resp.Flamegraph = phlaremodel.NewFlameGraph(t, maxNodes)
 	case querierv1.ProfileFormat_PROFILE_FORMAT_TREE:
-		resp.Tree = t.Bytes(c.Msg.GetMaxNodes(), nil)
+		resp.Tree = t.Bytes(maxNodes, nil)
 	}
 	return connect.NewResponse(&resp), nil
 }
 
+// selectMergeStacktracesTree merges the matching profiles into a single tree.
+// It returns the validated maxNodes (with the per-tenant default applied when
+// the request omits it, and clamped to the configured maximum) so that callers
+// truncate the final flame graph / tree with the same limit used for the
+// per-query fan-out. Callers MUST use the returned maxNodes rather than
+// c.Msg.GetMaxNodes(): the request value is 0 when the client omits it, which
+// disables truncation entirely and bypasses both the default and the max limit.
 func (f *Frontend) selectMergeStacktracesTree(
 	ctx context.Context,
 	c *connect.Request[querierv1.SelectMergeStacktracesRequest],
-) (*phlaremodel.FunctionNameTree, error) {
+) (*phlaremodel.FunctionNameTree, int64, error) {
 	ctx = connectgrpc.WithProcedure(ctx, querierv1connect.QuerierServiceSelectMergeStacktracesProcedure)
 	tenantIDs, err := tenant.TenantIDs(ctx)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+		return nil, 0, connect.NewError(connect.CodeInvalidArgument, err)
 	}
 
 	validated, err := validation.ValidateRangeRequest(f.limits, tenantIDs, model.Interval{Start: model.Time(c.Msg.Start), End: model.Time(c.Msg.End)}, model.Now())
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+		return nil, 0, connect.NewError(connect.CodeInvalidArgument, err)
 	}
 	if validated.IsEmpty {
-		return new(phlaremodel.FunctionNameTree), nil
+		return new(phlaremodel.FunctionNameTree), 0, nil
 	}
 	maxNodes, err := validation.ValidateMaxNodes(f.limits, tenantIDs, c.Msg.GetMaxNodes())
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+		return nil, 0, connect.NewError(connect.CodeInvalidArgument, err)
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
@@ -102,8 +109,8 @@ func (f *Frontend) selectMergeStacktracesTree(
 	}
 
 	if err = g.Wait(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	return m.Tree(), nil
+	return m.Tree(), maxNodes, nil
 }

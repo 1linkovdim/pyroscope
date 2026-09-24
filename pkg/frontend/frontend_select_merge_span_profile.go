@@ -84,9 +84,12 @@ func (f *Frontend) SelectMergeSpanProfile(
 	var resp querierv1.SelectMergeSpanProfileResponse
 	switch c.Msg.Format {
 	default:
-		resp.Flamegraph = phlaremodel.NewFlameGraph(t, c.Msg.GetMaxNodes())
+		// Use the validated maxNodes (default applied, clamped to the max), not
+		// c.Msg.GetMaxNodes(): the request value is 0 when omitted, which would
+		// disable truncation of the final flame graph and bypass both limits.
+		resp.Flamegraph = phlaremodel.NewFlameGraph(t, maxNodes)
 	case querierv1.ProfileFormat_PROFILE_FORMAT_TREE:
-		resp.Tree = t.Bytes(c.Msg.GetMaxNodes(), nil)
+		resp.Tree = t.Bytes(maxNodes, nil)
 	}
 	return connect.NewResponse(&resp), nil
 }
