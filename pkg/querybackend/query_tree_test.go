@@ -4,11 +4,55 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
 	queryv1 "github.com/grafana/pyroscope/api/gen/proto/go/query/v1"
 	phlaremodel "github.com/grafana/pyroscope/v2/pkg/model"
 )
+
+func (s *testSuite) Test_QueryTree_StageTimings() {
+	_, err := s.reader.Invoke(s.ctx, &queryv1.InvokeRequest{
+		EndTime:       time.Now().UnixMilli(),
+		LabelSelector: "{}",
+		QueryPlan:     s.plan,
+		Query: []*queryv1.Query{{
+			QueryType: queryv1.QueryType_QUERY_TREE,
+			Tree:      &queryv1.TreeQuery{MaxNodes: 16},
+		}},
+		Tenant: s.tenant,
+	})
+	s.Require().NoError(err)
+
+	reg := prometheus.NewRegistry()
+	s.Require().NoError(reg.Register(s.reader.metrics.blockStageDuration))
+	families, err := reg.Gather()
+	s.Require().NoError(err)
+
+	stages := map[string]bool{
+		"tree_entries_sum":   false,
+		"tree_scan_sum":      false,
+		"tree_resolve_sum":   false,
+		"tree_serialize_sum": false,
+	}
+	for _, family := range families {
+		if family.GetName() != "pyroscope_query_backend_block_stage_duration_seconds" {
+			continue
+		}
+		for _, metric := range family.Metric {
+			for _, label := range metric.Label {
+				if label.GetName() == "stage" {
+					if _, ok := stages[label.GetValue()]; ok && metric.GetHistogram().GetSampleCount() > 0 {
+						stages[label.GetValue()] = true
+					}
+				}
+			}
+		}
+	}
+	for stage, observed := range stages {
+		s.Assert().True(observed, "stage %s was not observed", stage)
+	}
+}
 
 // Test_QueryTree_FullSymbols_Basic verifies that a tree query with FullSymbols=true
 // returns a populated symbol table whose slice lengths are consistent.

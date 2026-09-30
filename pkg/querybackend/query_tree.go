@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/grafana/dskit/runutil"
 	"go.opentelemetry.io/otel/attribute"
@@ -76,7 +77,9 @@ func queryTree(q *queryContext, query *queryv1.Query) (*queryv1.Report, error) {
 		}
 	}
 
+	entriesStart := time.Now()
 	entries, err := profileEntryIterator(q, profileOpts...)
+	q.timings.treeEntriesNS.Add(time.Since(entriesStart).Nanoseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -135,6 +138,9 @@ func queryTree(q *queryContext, query *queryv1.Query) (*queryv1.Report, error) {
 	resolver := symdb.NewResolver(q.ctx, q.ds.Symbols(), resolverOptions...)
 	defer resolver.Release()
 
+	// Profile row iteration and AddSamples are interleaved. Time the whole
+	// scan once rather than adding clock reads to every profile row.
+	scanStart := time.Now()
 	switch {
 	case len(spanSelector) > 0:
 		for profiles.Next() {
@@ -165,16 +171,21 @@ func queryTree(q *queryContext, query *queryv1.Query) (*queryv1.Report, error) {
 		}
 	}
 
-	if err = profiles.Err(); err != nil {
+	err = profiles.Err()
+	q.timings.treeScanNS.Add(time.Since(scanStart).Nanoseconds())
+	if err != nil {
 		return nil, err
 	}
 
 	// output full pprof tree if that's requested
 	if mode == queryv1.SymbolMode_SYMBOL_MODE_FULL {
+		resolveStart := time.Now()
 		tree, symbolBuilder, err := resolver.LocationRefNameTree()
+		q.timings.treeResolveNS.Add(time.Since(resolveStart).Nanoseconds())
 		if err != nil {
 			return nil, err
 		}
+		serializeStart := time.Now()
 		resp := &queryv1.Report{
 			Tree: &queryv1.TreeReport{
 				Query:   query.Tree.CloneVT(),
@@ -183,20 +194,25 @@ func queryTree(q *queryContext, query *queryv1.Query) (*queryv1.Report, error) {
 			},
 		}
 		symbolBuilder.Build(resp.Tree.Symbols)
+		q.timings.treeSerializeNS.Add(time.Since(serializeStart).Nanoseconds())
 		return resp, nil
 	}
 
+	resolveStart := time.Now()
 	tree, err := resolver.Tree()
+	q.timings.treeResolveNS.Add(time.Since(resolveStart).Nanoseconds())
 	if err != nil {
 		return nil, err
 	}
 
+	serializeStart := time.Now()
 	resp := &queryv1.Report{
 		Tree: &queryv1.TreeReport{
 			Query: query.Tree.CloneVT(),
 			Tree:  tree.Bytes(query.Tree.GetMaxNodes(), nil),
 		},
 	}
+	q.timings.treeSerializeNS.Add(time.Since(serializeStart).Nanoseconds())
 	return resp, nil
 }
 

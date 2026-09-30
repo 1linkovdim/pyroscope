@@ -105,9 +105,14 @@ type blockTimings struct {
 	datasetWait time.Duration
 	openNS      atomic.Int64
 	queryNS     atomic.Int64
-	aggregateNS atomic.Int64
-	closeNS     atomic.Int64
-	queries     atomic.Int64
+	// Tree-query stages are accumulated once per dataset, not per profile row.
+	treeEntriesNS   atomic.Int64
+	treeScanNS      atomic.Int64
+	treeResolveNS   atomic.Int64
+	treeSerializeNS atomic.Int64
+	aggregateNS     atomic.Int64
+	closeNS         atomic.Int64
+	queries         atomic.Int64
 }
 
 func (b *blockContext) execute() error {
@@ -178,6 +183,10 @@ func (b *blockContext) reportTimings(start time.Time) {
 			{"dataset_wait", b.timings.datasetWait},
 			{"dataset_open_sum", time.Duration(b.timings.openNS.Load())},
 			{"query_sum", time.Duration(b.timings.queryNS.Load())},
+			{"tree_entries_sum", time.Duration(b.timings.treeEntriesNS.Load())},
+			{"tree_scan_sum", time.Duration(b.timings.treeScanNS.Load())},
+			{"tree_resolve_sum", time.Duration(b.timings.treeResolveNS.Load())},
+			{"tree_serialize_sum", time.Duration(b.timings.treeSerializeNS.Load())},
 			{"aggregate_sum", time.Duration(b.timings.aggregateNS.Load())},
 			{"dataset_close_sum", time.Duration(b.timings.closeNS.Load())},
 		} {
@@ -203,6 +212,10 @@ func (b *blockContext) reportTimings(start time.Time) {
 		"dataset_wait_ms", b.timings.datasetWait.Milliseconds(),
 		"dataset_open_sum_ms", time.Duration(b.timings.openNS.Load()).Milliseconds(),
 		"query_sum_ms", time.Duration(b.timings.queryNS.Load()).Milliseconds(),
+		"tree_entries_sum_ms", time.Duration(b.timings.treeEntriesNS.Load()).Milliseconds(),
+		"tree_scan_sum_ms", time.Duration(b.timings.treeScanNS.Load()).Milliseconds(),
+		"tree_resolve_sum_ms", time.Duration(b.timings.treeResolveNS.Load()).Milliseconds(),
+		"tree_serialize_sum_ms", time.Duration(b.timings.treeSerializeNS.Load()).Milliseconds(),
 		"aggregate_sum_ms", time.Duration(b.timings.aggregateNS.Load()).Milliseconds(),
 		"dataset_close_sum_ms", time.Duration(b.timings.closeNS.Load()).Milliseconds(),
 	)
