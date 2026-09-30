@@ -135,6 +135,7 @@ func (b *BlockReader) Invoke(
 		g.Go(util.RecoverPanic((&blockContext{
 			ctx:             ctx,
 			log:             b.log,
+			metrics:         b.metrics,
 			req:             r,
 			agg:             agg,
 			obj:             obj,

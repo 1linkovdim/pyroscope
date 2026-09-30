@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log"
@@ -85,6 +86,7 @@ func registerQueryType(
 type blockContext struct {
 	ctx             context.Context
 	log             log.Logger
+	metrics         *metrics
 	req             *request
 	agg             *reportAggregator
 	obj             *block.Object
@@ -92,6 +94,20 @@ type blockContext struct {
 	execCollector   *blockExecutionCollector
 	weightCollector *queryWeightCollector
 	includeStripped bool
+	timings         blockTimings
+}
+
+// blockTimings keeps per-dataset stage totals without a span for each stage.
+// Query types within a dataset can run concurrently, so the totals are not
+// necessarily additive with datasetWait or the block wall time.
+type blockTimings struct {
+	indexLookup time.Duration
+	datasetWait time.Duration
+	openNS      atomic.Int64
+	queryNS     atomic.Int64
+	aggregateNS atomic.Int64
+	closeNS     atomic.Int64
+	queries     atomic.Int64
 }
 
 func (b *blockContext) execute() error {
@@ -100,9 +116,13 @@ func (b *blockContext) execute() error {
 	var span *tracing.Span
 	span, b.ctx = tracing.StartSpanFromContext(b.ctx, "blockContext.execute")
 	defer span.Finish()
+	defer b.reportTimings(startTime)
 
 	if idxs := b.datasetIndices(); len(idxs) > 0 {
-		if err := b.lookupDatasets(idxs); err != nil {
+		lookupStart := time.Now()
+		err := b.lookupDatasets(idxs)
+		b.timings.indexLookup = time.Since(lookupStart)
+		if err != nil {
 			if b.obj.IsNotExists(err) {
 				level.Warn(b.log).Log("msg", "object not found", "err", err)
 				return nil
@@ -116,13 +136,16 @@ func (b *blockContext) execute() error {
 
 	md := b.obj.Metadata()
 	for _, ds := range md.Datasets {
+		datasetStart := time.Now()
 		q := b.newQueryContext(ds)
 		for _, query := range b.req.src.Query {
 			q.grp.Go(util.RecoverPanic(func() error {
 				return q.execute(query)
 			}))
 		}
-		if err := q.grp.Wait(); err != nil {
+		err := q.grp.Wait()
+		b.timings.datasetWait += time.Since(datasetStart)
+		if err != nil {
 			return err
 		}
 	}
@@ -140,6 +163,49 @@ func (b *blockContext) execute() error {
 	}
 
 	return nil
+}
+
+func (b *blockContext) reportTimings(start time.Time) {
+	total := time.Since(start)
+	if b.metrics != nil {
+		observe := b.metrics.blockStageDuration.WithLabelValues
+		observe("total").Observe(total.Seconds())
+		for _, stage := range []struct {
+			name     string
+			duration time.Duration
+		}{
+			{"index_lookup", b.timings.indexLookup},
+			{"dataset_wait", b.timings.datasetWait},
+			{"dataset_open_sum", time.Duration(b.timings.openNS.Load())},
+			{"query_sum", time.Duration(b.timings.queryNS.Load())},
+			{"aggregate_sum", time.Duration(b.timings.aggregateNS.Load())},
+			{"dataset_close_sum", time.Duration(b.timings.closeNS.Load())},
+		} {
+			if stage.duration > 0 {
+				observe(stage.name).Observe(stage.duration.Seconds())
+			}
+		}
+	}
+	if total < time.Second {
+		return
+	}
+	traceID, _ := tracing.ExtractTraceID(b.ctx)
+	md := b.obj.Metadata()
+	level.Info(b.log).Log(
+		"msg", "slow query backend block",
+		"trace_id", traceID,
+		"block_id", md.Id,
+		"compaction_level", md.CompactionLevel,
+		"datasets", len(md.Datasets),
+		"queries", b.timings.queries.Load(),
+		"total_ms", total.Milliseconds(),
+		"index_lookup_ms", b.timings.indexLookup.Milliseconds(),
+		"dataset_wait_ms", b.timings.datasetWait.Milliseconds(),
+		"dataset_open_sum_ms", time.Duration(b.timings.openNS.Load()).Milliseconds(),
+		"query_sum_ms", time.Duration(b.timings.queryNS.Load()).Milliseconds(),
+		"aggregate_sum_ms", time.Duration(b.timings.aggregateNS.Load()).Milliseconds(),
+		"dataset_close_sum_ms", time.Duration(b.timings.closeNS.Load()).Milliseconds(),
+	)
 }
 
 // datasetIndices returns the Format1 (dataset_tsdb_index) pseudo-datasets
@@ -265,6 +331,7 @@ type queryContext struct {
 }
 
 func (q *queryContext) execute(query *queryv1.Query) error {
+	q.timings.queries.Add(1)
 	var span *tracing.Span
 	span, q.ctx = tracing.StartSpanFromContext(q.ctx, "executeQuery."+util.ToCamel(query.QueryType.String()))
 	defer span.Finish()
@@ -273,7 +340,10 @@ func (q *queryContext) execute(query *queryv1.Query) error {
 		return err
 	}
 
-	if err = q.ds.Open(q.ctx, q.sections()...); err != nil {
+	openStart := time.Now()
+	err = q.ds.Open(q.ctx, q.sections()...)
+	q.timings.openNS.Add(time.Since(openStart).Nanoseconds())
+	if err != nil {
 		if q.obj.IsNotExists(err) {
 			level.Warn(q.log).Log("msg", "object not found", "err", err)
 			return nil
@@ -281,16 +351,23 @@ func (q *queryContext) execute(query *queryv1.Query) error {
 		return fmt.Errorf("failed to initialize query context: %w", err)
 	}
 	defer func() {
+		closeStart := time.Now()
 		_ = q.ds.CloseWithError(err)
+		q.timings.closeNS.Add(time.Since(closeStart).Nanoseconds())
 	}()
 
+	queryStart := time.Now()
 	r, err := handle(q, query)
+	q.timings.queryNS.Add(time.Since(queryStart).Nanoseconds())
 	if err != nil {
 		return err
 	}
 	if r != nil {
 		r.ReportType = QueryReportType(query.QueryType)
-		return q.agg.aggregateReport(r)
+		aggregateStart := time.Now()
+		reportErr := q.agg.aggregateReport(r)
+		q.timings.aggregateNS.Add(time.Since(aggregateStart).Nanoseconds())
+		return reportErr
 	}
 
 	return nil
