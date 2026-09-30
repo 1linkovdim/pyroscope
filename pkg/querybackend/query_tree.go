@@ -57,6 +57,7 @@ func treeSymbolMode(t *queryv1.TreeQuery) (queryv1.SymbolMode, error) {
 }
 
 func queryTree(q *queryContext, query *queryv1.Query) (*queryv1.Report, error) {
+	q.timings.treeQueries.Add(1)
 	mode, err := treeSymbolMode(query.Tree)
 	if err != nil {
 		return nil, err
@@ -125,8 +126,10 @@ func queryTree(q *queryContext, query *queryv1.Query) (*queryv1.Report, error) {
 		indices = append(indices, columns.TraceID.ColumnIndex)
 	}
 
+	treeStats := new(symdb.TreeStats)
 	resolverOptions := []symdb.ResolverOption{
 		symdb.WithResolverMaxNodes(query.Tree.MaxNodes),
+		symdb.WithResolverTreeStats(treeStats),
 	}
 	if query.Tree.StackTraceSelector != nil {
 		resolverOptions = append(resolverOptions, symdb.WithResolverStackTraceSelector(query.Tree.StackTraceSelector))
@@ -141,10 +144,13 @@ func queryTree(q *queryContext, query *queryv1.Query) (*queryv1.Report, error) {
 	// Profile row iteration and AddSamples are interleaved. Time the whole
 	// scan once rather than adding clock reads to every profile row.
 	scanStart := time.Now()
+	var profileRows, candidateSamples int64
 	switch {
 	case len(spanSelector) > 0:
 		for profiles.Next() {
 			p := profiles.At()
+			profileRows++
+			candidateSamples += int64(len(p.Values[0]))
 			resolver.AddSamplesWithSpanSelectorFromParquetRow(
 				p.Row.Partition,
 				p.Values[0],
@@ -156,6 +162,8 @@ func queryTree(q *queryContext, query *queryv1.Query) (*queryv1.Report, error) {
 	case len(traceSelector) > 0:
 		for profiles.Next() {
 			p := profiles.At()
+			profileRows++
+			candidateSamples += int64(len(p.Values[0]))
 			resolver.AddSamplesWithTraceSelectorFromParquetRow(
 				p.Row.Partition,
 				p.Values[0],
@@ -167,12 +175,18 @@ func queryTree(q *queryContext, query *queryv1.Query) (*queryv1.Report, error) {
 	default:
 		for profiles.Next() {
 			p := profiles.At()
+			profileRows++
+			candidateSamples += int64(len(p.Values[0]))
 			resolver.AddSamplesFromParquetRow(p.Row.Partition, p.Values[0], p.Values[1])
 		}
 	}
 
 	err = profiles.Err()
-	q.timings.treeScanNS.Add(time.Since(scanStart).Nanoseconds())
+	scanDuration := time.Since(scanStart)
+	q.timings.treeScanNS.Add(scanDuration.Nanoseconds())
+	maxAtomicDuration(&q.timings.treeScanMaxNS, scanDuration)
+	q.timings.treeProfileRows.Add(profileRows)
+	q.timings.treeCandidateSamples.Add(candidateSamples)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +195,10 @@ func queryTree(q *queryContext, query *queryv1.Query) (*queryv1.Report, error) {
 	if mode == queryv1.SymbolMode_SYMBOL_MODE_FULL {
 		resolveStart := time.Now()
 		tree, symbolBuilder, err := resolver.LocationRefNameTree()
-		q.timings.treeResolveNS.Add(time.Since(resolveStart).Nanoseconds())
+		resolveDuration := time.Since(resolveStart)
+		q.timings.treeResolveNS.Add(resolveDuration.Nanoseconds())
+		maxAtomicDuration(&q.timings.treeResolveMaxNS, resolveDuration)
+		q.recordTreeStats(treeStats.Snapshot())
 		if err != nil {
 			return nil, err
 		}
@@ -195,12 +212,16 @@ func queryTree(q *queryContext, query *queryv1.Query) (*queryv1.Report, error) {
 		}
 		symbolBuilder.Build(resp.Tree.Symbols)
 		q.timings.treeSerializeNS.Add(time.Since(serializeStart).Nanoseconds())
+		q.timings.treeOutputBytes.Add(int64(len(resp.Tree.Tree)))
 		return resp, nil
 	}
 
 	resolveStart := time.Now()
 	tree, err := resolver.Tree()
-	q.timings.treeResolveNS.Add(time.Since(resolveStart).Nanoseconds())
+	resolveDuration := time.Since(resolveStart)
+	q.timings.treeResolveNS.Add(resolveDuration.Nanoseconds())
+	maxAtomicDuration(&q.timings.treeResolveMaxNS, resolveDuration)
+	q.recordTreeStats(treeStats.Snapshot())
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +234,21 @@ func queryTree(q *queryContext, query *queryv1.Query) (*queryv1.Report, error) {
 		},
 	}
 	q.timings.treeSerializeNS.Add(time.Since(serializeStart).Nanoseconds())
+	q.timings.treeOutputBytes.Add(int64(len(resp.Tree.Tree)))
 	return resp, nil
+}
+
+func (q *queryContext) recordTreeStats(stats symdb.TreeStatsSnapshot) {
+	q.timings.treePartitions.Add(stats.Partitions)
+	q.timings.treeUniqueStacks.Add(stats.UniqueStackIDs)
+	q.timings.treeFetchNS.Add(stats.Fetch.Nanoseconds())
+	maxAtomicDuration(&q.timings.treeFetchMaxNS, stats.FetchMax)
+	q.timings.treeFetchWaitNS.Add(stats.FetchWait.Nanoseconds())
+	maxAtomicDuration(&q.timings.treeFetchWaitMaxNS, stats.FetchWaitMax)
+	q.timings.treeBuildNS.Add(stats.Build.Nanoseconds())
+	maxAtomicDuration(&q.timings.treeBuildMaxNS, stats.BuildMax)
+	q.timings.treeMergeWaitNS.Add(stats.MergeWait.Nanoseconds())
+	q.timings.treeMergeNS.Add(stats.Merge.Nanoseconds())
 }
 
 type treeAggregator struct {

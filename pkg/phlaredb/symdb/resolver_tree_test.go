@@ -3,6 +3,7 @@ package symdb
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -114,6 +115,28 @@ func Test_block_Resolver_ResolveTree(t *testing.T) {
 	resolved, err := r.Tree()
 	require.NoError(t, err)
 	require.Equal(t, expectedFingerprint, treeFingerprint(resolved))
+}
+
+func Test_block_Resolver_TreeStats(t *testing.T) {
+	s := newBlockSuite(t, [][]string{{"testdata/profile.pb.gz"}})
+	defer s.teardown()
+
+	stats := new(TreeStats)
+	r := NewResolver(context.Background(), s.reader, WithResolverTreeStats(stats))
+	defer r.Release()
+	r.AddSamples(0, s.indexed[0][1].Samples)
+	_, err := r.Tree()
+	require.NoError(t, err)
+
+	got := stats.Snapshot()
+	require.EqualValues(t, 1, got.Partitions)
+	require.Greater(t, got.UniqueStackIDs, int64(0))
+	require.Greater(t, got.Fetch, time.Duration(0))
+	require.Equal(t, got.Fetch, got.FetchMax)
+	require.Greater(t, got.FetchWait, time.Duration(0))
+	require.Equal(t, got.FetchWait, got.FetchWaitMax)
+	require.Greater(t, got.Build, time.Duration(0))
+	require.Equal(t, got.Build, got.BuildMax)
 }
 
 func Benchmark_Resolver_ResolveTree_Small(b *testing.B) {

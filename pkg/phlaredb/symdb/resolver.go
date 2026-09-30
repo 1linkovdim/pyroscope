@@ -4,6 +4,7 @@ import (
 	"context"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/grafana/dskit/tracing"
 	"github.com/parquet-go/parquet-go"
@@ -39,6 +40,7 @@ type Resolver struct {
 	maxNodes        int64
 	sts             *typesv1.StackTraceSelector
 	sanitizeOnMerge bool
+	treeStats       *TreeStats
 }
 
 type ResolverOption func(*Resolver)
@@ -75,6 +77,14 @@ func WithResolverSanitizeOnMerge(sanitizeOnMerge bool) ResolverOption {
 	}
 }
 
+// WithResolverTreeStats enables per-partition timing and work counts for tree
+// queries without adding timers to the per-sample processing loop.
+func WithResolverTreeStats(stats *TreeStats) ResolverOption {
+	return func(r *Resolver) {
+		r.treeStats = stats
+	}
+}
+
 type lazyPartition struct {
 	id uint64
 
@@ -90,7 +100,11 @@ type lazyPartition struct {
 
 func (p *lazyPartition) fetch(ctx context.Context) error {
 	p.fetchOnce.Do(func() {
+		start := time.Now()
 		p.reader, p.err = p.resolver.s.Partition(ctx, p.id)
+		if p.resolver.treeStats != nil {
+			p.resolver.treeStats.recordFetch(time.Since(start))
+		}
 		if p.err == nil && p.resolver.sts != nil {
 			p.selection = SelectStackTraces(p.reader.Symbols(), p.resolver.sts)
 		}
@@ -248,6 +262,9 @@ func (r *Resolver) partition(partition uint64) *lazyPartition {
 		resolver: r,
 	}
 	r.p[partition] = p
+	if r.treeStats != nil {
+		r.treeStats.partitions.Add(1)
+	}
 	r.m.Unlock()
 	// Fetch partition in the background, not blocking the caller.
 	// p.reader must be accessed only after p.fetch returns.
@@ -270,6 +287,7 @@ func (r *Resolver) LocationRefNameTree() (*model.LocationRefNameTree, ResultBuil
 	var lock sync.Mutex
 	tree := new(model.LocationRefNameTree)
 	err := r.withSymbols(ctx, func(symbols *Symbols, appender *SampleAppender) error {
+		buildStart := time.Now()
 		locMap := make(map[uint32]struct{})
 		lookup := func(locID int32) model.LocationRefName {
 			locMap[uint32(locID)] = struct{}{}
@@ -277,6 +295,9 @@ func (r *Resolver) LocationRefNameTree() (*model.LocationRefNameTree, ResultBuil
 		}
 		resolved, err := symbols.LocationRefNameTree(ctx, appender, r.maxNodes, SelectStackTraces(symbols, r.sts), lookup)
 		if err != nil {
+			if r.treeStats != nil {
+				r.treeStats.recordBuild(time.Since(buildStart))
+			}
 			return err
 		}
 
@@ -285,13 +306,26 @@ func (r *Resolver) LocationRefNameTree() (*model.LocationRefNameTree, ResultBuil
 		// merge symbols
 		cb, err := sym.addSymbols(symbols, locIDs)
 		if err != nil {
+			if r.treeStats != nil {
+				r.treeStats.recordBuild(time.Since(buildStart))
+			}
 			return err
 		}
 		resolved.FormatNodeNames(cb)
+		if r.treeStats != nil {
+			r.treeStats.recordBuild(time.Since(buildStart))
+		}
 
+		mergeWaitStart := time.Now()
 		lock.Lock()
+		mergeStart := time.Now()
 		tree.Merge(resolved)
+		mergeElapsed := time.Since(mergeStart)
 		lock.Unlock()
+		if r.treeStats != nil {
+			r.treeStats.mergeWaitNS.Add(mergeStart.Sub(mergeWaitStart).Nanoseconds())
+			r.treeStats.mergeNS.Add(mergeElapsed.Nanoseconds())
+		}
 		return nil
 	})
 	tree.Total()
@@ -308,13 +342,24 @@ func (r *Resolver) Tree() (*model.FunctionNameTree, error) {
 		lookup := func(i int32) model.FunctionName {
 			return model.FunctionName(symbols.Strings[i])
 		}
+		buildStart := time.Now()
 		resolved, err := symbols.Tree(ctx, appender, r.maxNodes, SelectStackTraces(symbols, r.sts), lookup)
+		if r.treeStats != nil {
+			r.treeStats.recordBuild(time.Since(buildStart))
+		}
 		if err != nil {
 			return err
 		}
+		mergeWaitStart := time.Now()
 		lock.Lock()
+		mergeStart := time.Now()
 		tree.Merge(resolved)
+		mergeElapsed := time.Since(mergeStart)
 		lock.Unlock()
+		if r.treeStats != nil {
+			r.treeStats.mergeWaitNS.Add(mergeStart.Sub(mergeWaitStart).Nanoseconds())
+			r.treeStats.mergeNS.Add(mergeElapsed.Nanoseconds())
+		}
 		return nil
 	})
 	return tree, err
@@ -368,8 +413,16 @@ func (r *Resolver) withSymbols(ctx context.Context, fn func(*Symbols, *SampleApp
 	for _, p := range r.p {
 		p := p
 		g.Go(util.RecoverPanic(func() error {
-			if err := p.fetch(ctx); err != nil {
-				return err
+			waitStart := time.Now()
+			fetchErr := p.fetch(ctx)
+			if r.treeStats != nil {
+				r.treeStats.recordFetchWait(time.Since(waitStart))
+			}
+			if fetchErr != nil {
+				return fetchErr
+			}
+			if r.treeStats != nil {
+				r.treeStats.uniqueStackIDs.Add(int64(p.samples.Len()))
 			}
 			return fn(p.reader.Symbols(), p.samples)
 		}))

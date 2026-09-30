@@ -26,24 +26,44 @@ func (s *testSuite) Test_QueryTree_StageTimings() {
 
 	reg := prometheus.NewRegistry()
 	s.Require().NoError(reg.Register(s.reader.metrics.blockStageDuration))
+	s.Require().NoError(reg.Register(s.reader.metrics.blockWorkItems))
+	s.Require().NoError(reg.Register(s.reader.metrics.blockWorkBytes))
 	families, err := reg.Gather()
 	s.Require().NoError(err)
 
 	stages := map[string]bool{
-		"tree_entries_sum":   false,
-		"tree_scan_sum":      false,
-		"tree_resolve_sum":   false,
-		"tree_serialize_sum": false,
+		"object_open_sum":          false,
+		"profiles_open_sum":        false,
+		"tsdb_open_sum":            false,
+		"symbols_open_sum":         false,
+		"tree_entries_sum":         false,
+		"tree_scan_sum":            false,
+		"tree_resolve_sum":         false,
+		"tree_serialize_sum":       false,
+		"tree_partition_fetch_sum": false,
+		"tree_partition_wait_sum":  false,
+		"tree_build_sum":           false,
 	}
+	items := map[string]bool{"profile_rows": false, "candidate_samples": false, "symbol_partitions": false, "unique_stacktrace_ids": false}
+	bytes := map[string]bool{"profiles_estimate": false, "symbols_estimate": false, "tree_output": false}
 	for _, family := range families {
-		if family.GetName() != "pyroscope_query_backend_block_stage_duration_seconds" {
-			continue
-		}
 		for _, metric := range family.Metric {
 			for _, label := range metric.Label {
-				if label.GetName() == "stage" {
+				switch family.GetName() {
+				case "pyroscope_query_backend_block_stage_duration_seconds":
+					if label.GetName() != "stage" {
+						continue
+					}
 					if _, ok := stages[label.GetValue()]; ok && metric.GetHistogram().GetSampleCount() > 0 {
 						stages[label.GetValue()] = true
+					}
+				case "pyroscope_query_backend_block_work_items":
+					if label.GetName() == "kind" && metric.GetHistogram().GetSampleSum() > 0 {
+						items[label.GetValue()] = true
+					}
+				case "pyroscope_query_backend_block_work_bytes":
+					if label.GetName() == "kind" && metric.GetHistogram().GetSampleSum() > 0 {
+						bytes[label.GetValue()] = true
 					}
 				}
 			}
@@ -51,6 +71,12 @@ func (s *testSuite) Test_QueryTree_StageTimings() {
 	}
 	for stage, observed := range stages {
 		s.Assert().True(observed, "stage %s was not observed", stage)
+	}
+	for kind, observed := range items {
+		s.Assert().True(observed, "work item %s was not observed", kind)
+	}
+	for kind, observed := range bytes {
+		s.Assert().True(observed, "work bytes %s was not observed", kind)
 	}
 }
 

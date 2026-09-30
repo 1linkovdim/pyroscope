@@ -101,18 +101,50 @@ type blockContext struct {
 // Query types within a dataset can run concurrently, so the totals are not
 // necessarily additive with datasetWait or the block wall time.
 type blockTimings struct {
-	indexLookup time.Duration
-	datasetWait time.Duration
-	openNS      atomic.Int64
-	queryNS     atomic.Int64
+	indexLookup    time.Duration
+	datasetWait    time.Duration
+	openNS         atomic.Int64
+	openMaxNS      atomic.Int64
+	objectOpenNS   atomic.Int64
+	prefetchNS     atomic.Int64
+	profilesOpenNS atomic.Int64
+	tsdbOpenNS     atomic.Int64
+	symbolsOpenNS  atomic.Int64
+	queryNS        atomic.Int64
+	queryMaxNS     atomic.Int64
 	// Tree-query stages are accumulated once per dataset, not per profile row.
-	treeEntriesNS   atomic.Int64
-	treeScanNS      atomic.Int64
-	treeResolveNS   atomic.Int64
-	treeSerializeNS atomic.Int64
-	aggregateNS     atomic.Int64
-	closeNS         atomic.Int64
-	queries         atomic.Int64
+	treeEntriesNS        atomic.Int64
+	treeScanNS           atomic.Int64
+	treeScanMaxNS        atomic.Int64
+	treeResolveNS        atomic.Int64
+	treeResolveMaxNS     atomic.Int64
+	treeSerializeNS      atomic.Int64
+	treeFetchNS          atomic.Int64
+	treeFetchMaxNS       atomic.Int64
+	treeFetchWaitNS      atomic.Int64
+	treeFetchWaitMaxNS   atomic.Int64
+	treeBuildNS          atomic.Int64
+	treeBuildMaxNS       atomic.Int64
+	treeMergeWaitNS      atomic.Int64
+	treeMergeNS          atomic.Int64
+	treeQueries          atomic.Int64
+	treeProfileRows      atomic.Int64
+	treeCandidateSamples atomic.Int64
+	treePartitions       atomic.Int64
+	treeUniqueStacks     atomic.Int64
+	treeOutputBytes      atomic.Int64
+	aggregateNS          atomic.Int64
+	closeNS              atomic.Int64
+	queries              atomic.Int64
+}
+
+func maxAtomicDuration(dst *atomic.Int64, d time.Duration) {
+	n := d.Nanoseconds()
+	for old := dst.Load(); n > old; old = dst.Load() {
+		if dst.CompareAndSwap(old, n) {
+			return
+		}
+	}
 }
 
 func (b *blockContext) execute() error {
@@ -172,6 +204,11 @@ func (b *blockContext) execute() error {
 
 func (b *blockContext) reportTimings(start time.Time) {
 	total := time.Since(start)
+	md := b.obj.Metadata()
+	var weight block.DatasetWeight
+	for _, ds := range md.Datasets {
+		weight.Add(block.WeightOf(ds))
+	}
 	if b.metrics != nil {
 		observe := b.metrics.blockStageDuration.WithLabelValues
 		observe("total").Observe(total.Seconds())
@@ -182,11 +219,28 @@ func (b *blockContext) reportTimings(start time.Time) {
 			{"index_lookup", b.timings.indexLookup},
 			{"dataset_wait", b.timings.datasetWait},
 			{"dataset_open_sum", time.Duration(b.timings.openNS.Load())},
+			{"dataset_open_max", time.Duration(b.timings.openMaxNS.Load())},
+			{"object_open_sum", time.Duration(b.timings.objectOpenNS.Load())},
+			{"dataset_prefetch_sum", time.Duration(b.timings.prefetchNS.Load())},
+			{"profiles_open_sum", time.Duration(b.timings.profilesOpenNS.Load())},
+			{"tsdb_open_sum", time.Duration(b.timings.tsdbOpenNS.Load())},
+			{"symbols_open_sum", time.Duration(b.timings.symbolsOpenNS.Load())},
 			{"query_sum", time.Duration(b.timings.queryNS.Load())},
+			{"query_max", time.Duration(b.timings.queryMaxNS.Load())},
 			{"tree_entries_sum", time.Duration(b.timings.treeEntriesNS.Load())},
 			{"tree_scan_sum", time.Duration(b.timings.treeScanNS.Load())},
+			{"tree_scan_max", time.Duration(b.timings.treeScanMaxNS.Load())},
 			{"tree_resolve_sum", time.Duration(b.timings.treeResolveNS.Load())},
+			{"tree_resolve_max", time.Duration(b.timings.treeResolveMaxNS.Load())},
 			{"tree_serialize_sum", time.Duration(b.timings.treeSerializeNS.Load())},
+			{"tree_partition_fetch_sum", time.Duration(b.timings.treeFetchNS.Load())},
+			{"tree_partition_fetch_max", time.Duration(b.timings.treeFetchMaxNS.Load())},
+			{"tree_partition_wait_sum", time.Duration(b.timings.treeFetchWaitNS.Load())},
+			{"tree_partition_wait_max", time.Duration(b.timings.treeFetchWaitMaxNS.Load())},
+			{"tree_build_sum", time.Duration(b.timings.treeBuildNS.Load())},
+			{"tree_build_max", time.Duration(b.timings.treeBuildMaxNS.Load())},
+			{"tree_merge_wait_sum", time.Duration(b.timings.treeMergeWaitNS.Load())},
+			{"tree_merge_sum", time.Duration(b.timings.treeMergeNS.Load())},
 			{"aggregate_sum", time.Duration(b.timings.aggregateNS.Load())},
 			{"dataset_close_sum", time.Duration(b.timings.closeNS.Load())},
 		} {
@@ -194,12 +248,24 @@ func (b *blockContext) reportTimings(start time.Time) {
 				observe(stage.name).Observe(stage.duration.Seconds())
 			}
 		}
+		if b.timings.treeQueries.Load() > 0 {
+			observeItems := b.metrics.blockWorkItems.WithLabelValues
+			observeItems("tree_queries").Observe(float64(b.timings.treeQueries.Load()))
+			observeItems("profile_rows").Observe(float64(b.timings.treeProfileRows.Load()))
+			observeItems("candidate_samples").Observe(float64(b.timings.treeCandidateSamples.Load()))
+			observeItems("symbol_partitions").Observe(float64(b.timings.treePartitions.Load()))
+			observeItems("unique_stacktrace_ids").Observe(float64(b.timings.treeUniqueStacks.Load()))
+			b.metrics.blockWorkBytes.WithLabelValues("tree_output").Observe(float64(b.timings.treeOutputBytes.Load()))
+		}
+		observeBytes := b.metrics.blockWorkBytes.WithLabelValues
+		observeBytes("profiles_estimate").Observe(float64(weight.ProfilesBytes))
+		observeBytes("tsdb_estimate").Observe(float64(weight.TSDBBytes))
+		observeBytes("symbols_estimate").Observe(float64(weight.SymbolsBytes))
 	}
 	if total < time.Second {
 		return
 	}
 	traceID, _ := tracing.ExtractTraceID(b.ctx)
-	md := b.obj.Metadata()
 	level.Info(b.log).Log(
 		"msg", "slow query backend block",
 		"trace_id", traceID,
@@ -207,15 +273,41 @@ func (b *blockContext) reportTimings(start time.Time) {
 		"compaction_level", md.CompactionLevel,
 		"datasets", len(md.Datasets),
 		"queries", b.timings.queries.Load(),
+		"tree_queries", b.timings.treeQueries.Load(),
+		"profile_rows", b.timings.treeProfileRows.Load(),
+		"candidate_samples", b.timings.treeCandidateSamples.Load(),
+		"symbol_partitions", b.timings.treePartitions.Load(),
+		"unique_stacktrace_ids", b.timings.treeUniqueStacks.Load(),
+		"profiles_estimate_bytes", weight.ProfilesBytes,
+		"tsdb_estimate_bytes", weight.TSDBBytes,
+		"symbols_estimate_bytes", weight.SymbolsBytes,
+		"tree_output_bytes", b.timings.treeOutputBytes.Load(),
 		"total_ms", total.Milliseconds(),
 		"index_lookup_ms", b.timings.indexLookup.Milliseconds(),
 		"dataset_wait_ms", b.timings.datasetWait.Milliseconds(),
 		"dataset_open_sum_ms", time.Duration(b.timings.openNS.Load()).Milliseconds(),
+		"dataset_open_max_ms", time.Duration(b.timings.openMaxNS.Load()).Milliseconds(),
+		"object_open_sum_ms", time.Duration(b.timings.objectOpenNS.Load()).Milliseconds(),
+		"dataset_prefetch_sum_ms", time.Duration(b.timings.prefetchNS.Load()).Milliseconds(),
+		"profiles_open_sum_ms", time.Duration(b.timings.profilesOpenNS.Load()).Milliseconds(),
+		"tsdb_open_sum_ms", time.Duration(b.timings.tsdbOpenNS.Load()).Milliseconds(),
+		"symbols_open_sum_ms", time.Duration(b.timings.symbolsOpenNS.Load()).Milliseconds(),
 		"query_sum_ms", time.Duration(b.timings.queryNS.Load()).Milliseconds(),
+		"query_max_ms", time.Duration(b.timings.queryMaxNS.Load()).Milliseconds(),
 		"tree_entries_sum_ms", time.Duration(b.timings.treeEntriesNS.Load()).Milliseconds(),
 		"tree_scan_sum_ms", time.Duration(b.timings.treeScanNS.Load()).Milliseconds(),
+		"tree_scan_max_ms", time.Duration(b.timings.treeScanMaxNS.Load()).Milliseconds(),
 		"tree_resolve_sum_ms", time.Duration(b.timings.treeResolveNS.Load()).Milliseconds(),
+		"tree_resolve_max_ms", time.Duration(b.timings.treeResolveMaxNS.Load()).Milliseconds(),
 		"tree_serialize_sum_ms", time.Duration(b.timings.treeSerializeNS.Load()).Milliseconds(),
+		"tree_partition_fetch_sum_ms", time.Duration(b.timings.treeFetchNS.Load()).Milliseconds(),
+		"tree_partition_fetch_max_ms", time.Duration(b.timings.treeFetchMaxNS.Load()).Milliseconds(),
+		"tree_partition_wait_sum_ms", time.Duration(b.timings.treeFetchWaitNS.Load()).Milliseconds(),
+		"tree_partition_wait_max_ms", time.Duration(b.timings.treeFetchWaitMaxNS.Load()).Milliseconds(),
+		"tree_build_sum_ms", time.Duration(b.timings.treeBuildNS.Load()).Milliseconds(),
+		"tree_build_max_ms", time.Duration(b.timings.treeBuildMaxNS.Load()).Milliseconds(),
+		"tree_merge_wait_sum_ms", time.Duration(b.timings.treeMergeWaitNS.Load()).Milliseconds(),
+		"tree_merge_sum_ms", time.Duration(b.timings.treeMergeNS.Load()).Milliseconds(),
 		"aggregate_sum_ms", time.Duration(b.timings.aggregateNS.Load()).Milliseconds(),
 		"dataset_close_sum_ms", time.Duration(b.timings.closeNS.Load()).Milliseconds(),
 	)
@@ -331,9 +423,26 @@ func (b *blockContext) lookupDatasets(indices []*metastorev1.Dataset) error {
 }
 
 func (b *blockContext) newQueryContext(ds *metastorev1.Dataset) *queryContext {
-	q := &queryContext{blockContext: b, ds: block.NewDataset(ds, b.obj)}
+	q := &queryContext{blockContext: b, ds: block.NewDataset(ds, b.obj, block.WithDatasetOpenObserver(b.recordDatasetOpen))}
 	q.grp, q.ctx = errgroup.WithContext(b.ctx)
 	return q
+}
+
+func (b *blockContext) recordDatasetOpen(stage block.DatasetOpenStage, d time.Duration) {
+	switch stage {
+	case block.DatasetOpenObject:
+		b.timings.objectOpenNS.Add(d.Nanoseconds())
+	case block.DatasetOpenPrefetch:
+		b.timings.prefetchNS.Add(d.Nanoseconds())
+	case block.DatasetOpenProfiles:
+		b.timings.profilesOpenNS.Add(d.Nanoseconds())
+	case block.DatasetOpenTSDB:
+		b.timings.tsdbOpenNS.Add(d.Nanoseconds())
+	case block.DatasetOpenSymbols:
+		b.timings.symbolsOpenNS.Add(d.Nanoseconds())
+	case block.DatasetOpenDatasetIndex:
+		// Dataset-index opening is part of lookupDatasets, not query dataset open.
+	}
 }
 
 type queryContext struct {
@@ -355,7 +464,9 @@ func (q *queryContext) execute(query *queryv1.Query) error {
 
 	openStart := time.Now()
 	err = q.ds.Open(q.ctx, q.sections()...)
-	q.timings.openNS.Add(time.Since(openStart).Nanoseconds())
+	openDuration := time.Since(openStart)
+	q.timings.openNS.Add(openDuration.Nanoseconds())
+	maxAtomicDuration(&q.timings.openMaxNS, openDuration)
 	if err != nil {
 		if q.obj.IsNotExists(err) {
 			level.Warn(q.log).Log("msg", "object not found", "err", err)
@@ -371,7 +482,9 @@ func (q *queryContext) execute(query *queryv1.Query) error {
 
 	queryStart := time.Now()
 	r, err := handle(q, query)
-	q.timings.queryNS.Add(time.Since(queryStart).Nanoseconds())
+	queryDuration := time.Since(queryStart)
+	q.timings.queryNS.Add(queryDuration.Nanoseconds())
+	maxAtomicDuration(&q.timings.queryMaxNS, queryDuration)
 	if err != nil {
 		return err
 	}

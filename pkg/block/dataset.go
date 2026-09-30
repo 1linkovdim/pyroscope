@@ -3,6 +3,7 @@ package block
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/grafana/dskit/multierror"
 	"github.com/parquet-go/parquet-go"
@@ -32,6 +33,19 @@ const (
 	SectionTSDB
 	SectionSymbols
 	SectionDatasetIndex
+)
+
+// DatasetOpenStage identifies coarse work performed while opening a dataset.
+// Sections may open concurrently, so their summed times are not wall time.
+type DatasetOpenStage string
+
+const (
+	DatasetOpenObject       DatasetOpenStage = "object"
+	DatasetOpenPrefetch     DatasetOpenStage = "prefetch"
+	DatasetOpenProfiles     DatasetOpenStage = "profiles"
+	DatasetOpenTSDB         DatasetOpenStage = "tsdb"
+	DatasetOpenSymbols      DatasetOpenStage = "symbols"
+	DatasetOpenDatasetIndex DatasetOpenStage = "dataset_index"
 )
 
 // DatasetWeight holds the section-level size breakdown of a dataset.
@@ -134,17 +148,22 @@ type Dataset struct {
 	symbols  *symdb.Reader
 	profiles *ParquetFile
 
-	memSize int
+	memSize      int
+	openObserver func(DatasetOpenStage, time.Duration)
 }
 
-func NewDataset(meta *metastorev1.Dataset, obj *Object) *Dataset {
-	return &Dataset{
+func NewDataset(meta *metastorev1.Dataset, obj *Object, opts ...DatasetOption) *Dataset {
+	s := &Dataset{
 		tenant:  obj.meta.StringTable[meta.Tenant],
 		name:    obj.meta.StringTable[meta.Name],
 		meta:    meta,
 		obj:     obj,
 		memSize: defaultTenantDatasetSizeLoadInMemory,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 type DatasetOption func(*Dataset)
@@ -152,6 +171,33 @@ type DatasetOption func(*Dataset)
 func WithDatasetMaxSizeLoadInMemory(size int) DatasetOption {
 	return func(s *Dataset) {
 		s.memSize = size
+	}
+}
+
+func WithDatasetOpenObserver(observer func(DatasetOpenStage, time.Duration)) DatasetOption {
+	return func(s *Dataset) {
+		s.openObserver = observer
+	}
+}
+
+func (s *Dataset) observeOpen(stage DatasetOpenStage, start time.Time) {
+	if s.openObserver != nil {
+		s.openObserver(stage, time.Since(start))
+	}
+}
+
+func (sc Section) openStage() DatasetOpenStage {
+	switch sc {
+	case SectionProfiles:
+		return DatasetOpenProfiles
+	case SectionTSDB:
+		return DatasetOpenTSDB
+	case SectionSymbols:
+		return DatasetOpenSymbols
+	case SectionDatasetIndex:
+		return DatasetOpenDatasetIndex
+	default:
+		panic(fmt.Sprintf("bug: unknown section: %d", sc))
 	}
 }
 
@@ -175,7 +221,10 @@ func (s *Dataset) open(ctx context.Context, sections ...Section) (err error) {
 		// The dataset has already been closed with an error.
 		return s.err
 	}
-	if err = s.obj.Open(ctx); err != nil {
+	objectStart := time.Now()
+	err = s.obj.Open(ctx)
+	s.observeOpen(DatasetOpenObject, objectStart)
+	if err != nil {
 		return fmt.Errorf("failed to open object: %w", err)
 	}
 	defer func() {
@@ -188,7 +237,10 @@ func (s *Dataset) open(ctx context.Context, sections ...Section) (err error) {
 	if s.obj.buf == nil && s.meta.Size < uint64(s.memSize) {
 		s.buf = bufferpool.GetBuffer(int(s.meta.Size))
 		off, size := int64(s.offset()), int64(s.meta.Size)
-		if err = objstore.ReadRange(ctx, s.buf, s.obj.path, s.obj.storage, off, size); err != nil {
+		prefetchStart := time.Now()
+		err = objstore.ReadRange(ctx, s.buf, s.obj.path, s.obj.storage, off, size)
+		s.observeOpen(DatasetOpenPrefetch, prefetchStart)
+		if err != nil {
 			return fmt.Errorf("loading sections into memory: %w", err)
 		}
 	}
@@ -196,7 +248,10 @@ func (s *Dataset) open(ctx context.Context, sections ...Section) (err error) {
 	for _, sc := range sections {
 		sc := sc
 		g.Go(util.RecoverPanic(func() error {
-			if openErr := sc.open(ctx, s); openErr != nil {
+			sectionStart := time.Now()
+			openErr := sc.open(ctx, s)
+			s.observeOpen(sc.openStage(), sectionStart)
+			if openErr != nil {
 				return fmt.Errorf("opening section %v: %w", s.section(sc).name, openErr)
 			}
 			return nil
